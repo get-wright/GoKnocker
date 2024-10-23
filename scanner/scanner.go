@@ -17,34 +17,49 @@ import (
 )
 
 type Scanner struct {
-	host         string
-	startPort    uint16
-	endPort      uint16
-	timeout      time.Duration
-	rateLimit    time.Duration
-	threads      int
-	debug        bool
-	results      chan models.PortResult
-	progress     chan float64
-	maxRetries   int
-	adjustRate   bool
-	minRateLimit time.Duration
-	maxRateLimit time.Duration
+	host          string
+	startPort     uint16
+	endPort       uint16
+	timeout       time.Duration
+	rateLimit     time.Duration
+	threads       int
+	debug         bool
+	results       chan models.PortResult
+	progress      chan float64
+	maxRetries    int
+	adjustRate    bool
+	minRateLimit  time.Duration
+	maxRateLimit  time.Duration
+	retryDelay    time.Duration
+	batchSize     int
+	earlyTimeout  time.Duration
+	progressMutex sync.Mutex
+	lastProgress  float64
+}
+
+type portScanResult struct {
+	port     uint16
+	isOpen   bool
+	response time.Duration
+	attempts int
 }
 
 func NewScanner() *Scanner {
 	return &Scanner{
 		startPort:    1,
 		endPort:      65535,
-		timeout:      time.Second * 2,        // Reduced default timeout
-		rateLimit:    time.Millisecond,       // 1000 scans per second default
-		threads:      500,                    // Increased default threads
-		maxRetries:   2,                      // Number of retries for validation
-		adjustRate:   true,                   // Enable dynamic rate adjustment
-		minRateLimit: time.Microsecond * 500, // Max 2000 scans per second
-		maxRateLimit: time.Millisecond * 5,   // Min 200 scans per second
+		timeout:      time.Second * 2,
+		rateLimit:    time.Millisecond, // 1000 scans per second default
+		threads:      500,
+		maxRetries:   3, // Multiple validation attempts
+		adjustRate:   true,
+		minRateLimit: time.Millisecond,       // Max 1000 scans per second
+		maxRateLimit: time.Millisecond * 10,  // Min 100 scans per second
+		retryDelay:   time.Millisecond * 100, // Delay between retries
+		batchSize:    1000,                   // Process ports in batches
+		earlyTimeout: time.Millisecond * 500, // Quick initial check timeout
 		results:      make(chan models.PortResult),
-		progress:     make(chan float64),
+		progress:     make(chan float64, 100), // Buffered progress channel
 	}
 }
 
@@ -67,6 +82,7 @@ func (s *Scanner) SetRateLimit(rate time.Duration) {
 
 func (s *Scanner) SetTimeout(timeout time.Duration) {
 	s.timeout = timeout
+	s.earlyTimeout = timeout / 4
 }
 
 func (s *Scanner) SetThreads(threads int) {
@@ -94,16 +110,25 @@ func (s *Scanner) GetProgressChan() chan float64 {
 	return s.progress
 }
 
-type portScanResult struct {
-	port     uint16
-	isOpen   bool
-	response time.Duration
+// updateProgress ensures monotonic progress updates
+func (s *Scanner) updateProgress(progress float64) {
+	s.progressMutex.Lock()
+	defer s.progressMutex.Unlock()
+
+	if progress > s.lastProgress {
+		s.lastProgress = progress
+		select {
+		case s.progress <- progress:
+		default:
+		}
+	}
 }
 
 // fastPortScan performs quick initial port scanning
 func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results chan<- portScanResult, errorRate *uint64) {
 	dialer := &net.Dialer{
-		Timeout: s.timeout / 2, // Shorter timeout for initial scan
+		Timeout:   s.earlyTimeout,
+		KeepAlive: -1, // Disable keep-alive
 	}
 
 	for port := range ports {
@@ -111,41 +136,71 @@ func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results c
 		case <-ctx.Done():
 			return
 		default:
-			start := time.Now()
-			address := fmt.Sprintf("%s:%d", s.host, port)
-			conn, err := dialer.DialContext(ctx, "tcp", address)
+			var isOpen bool
+			var bestResponse time.Duration
+			attempts := 0
 
-			if err == nil {
-				conn.Close()
+			// Multiple quick checks for consistency
+			for i := 0; i < 2; i++ {
+				attempts++
+				start := time.Now()
+				conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.host, port))
+
+				if err == nil {
+					conn.Close()
+					isOpen = true
+					response := time.Since(start)
+					if bestResponse == 0 || response < bestResponse {
+						bestResponse = response
+					}
+					break // Success, no need for more attempts
+				} else {
+					if !strings.Contains(err.Error(), "refused") {
+						atomic.AddUint64(errorRate, 1)
+					}
+					// If connection was refused, it's definitely closed
+					if strings.Contains(err.Error(), "refused") {
+						break
+					}
+				}
+
+				if i < 1 { // Don't sleep after last attempt
+					time.Sleep(s.retryDelay / 2)
+				}
+			}
+
+			if isOpen {
 				results <- portScanResult{
 					port:     port,
 					isOpen:   true,
-					response: time.Since(start),
+					response: bestResponse,
+					attempts: attempts,
 				}
-			} else if !strings.Contains(err.Error(), "refused") {
-				atomic.AddUint64(errorRate, 1)
 			}
 
-			// Dynamic rate limiting based on error rate
+			// Dynamic rate limiting with error rate consideration
 			if s.adjustRate {
 				errorRateValue := atomic.LoadUint64(errorRate)
-				if errorRateValue > 10 && s.rateLimit < s.maxRateLimit {
-					s.rateLimit += time.Microsecond * 100
-				} else if errorRateValue < 5 && s.rateLimit > s.minRateLimit {
-					s.rateLimit -= time.Microsecond * 50
+				if errorRateValue > uint64(s.threads/2) {
+					atomic.StoreUint64(errorRate, 0)
+					newRate := s.rateLimit * 2
+					if newRate <= s.maxRateLimit {
+						s.rateLimit = newRate
+					}
+				} else if errorRateValue == 0 && s.rateLimit > s.minRateLimit {
+					newRate := s.rateLimit / 2
+					if newRate >= s.minRateLimit {
+						s.rateLimit = newRate
+					}
 				}
 			}
 
-			select {
-			case <-time.After(s.rateLimit):
-			case <-ctx.Done():
-				return
-			}
+			time.Sleep(s.rateLimit)
 		}
 	}
 }
 
-// validatePort performs thorough port and service detection
+// validatePort performs thorough port validation and service detection
 func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) models.PortResult {
 	result := models.PortResult{
 		IP:           net.ParseIP(s.host),
@@ -164,6 +219,9 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 			if strings.Contains(err.Error(), "refused") {
 				result.State = "filtered"
 			}
+			if attempt < s.maxRetries-1 {
+				time.Sleep(s.retryDelay)
+			}
 			continue
 		}
 
@@ -171,7 +229,54 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 		defer conn.Close()
 		successfulProbe = true
 
-		// Check Windows services first
+		// Get initial banner for protocol detection
+		banner := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(s.timeout))
+		n, _ := conn.Read(banner)
+
+		if n > 0 {
+			result.Banner = bytes.TrimSpace(banner[:n])
+
+			// Try to identify service based on protocol fingerprint
+			fingerprint := services.NewFingerprint(banner[:n])
+			if protocol := fingerprint.IdentifyProtocol(); protocol != "" {
+				switch protocol {
+				case "HTTP":
+					if info := services.ProbeHTTP(s.host, port, s.timeout, false); info != nil {
+						result.Service = "HTTP"
+						result.HttpInfo = info
+						if info.Server != "" {
+							result.Version = info.Server
+						}
+						return result
+					}
+
+				case "SSH":
+					if service, version := services.TrySSH(address, s.timeout); service != "" {
+						result.Service = service
+						result.Version = version
+						return result
+					}
+
+				case "SMB", "LDAP", "DNS", "RPC":
+					if service, version := windows.ProbeService(s.host, port, s.timeout); service != "" {
+						result.Service = service
+						result.Version = version
+						return result
+					}
+
+				default:
+					// For other identified protocols, at least set the service name
+					result.Service = protocol
+					if version := fingerprint.ExtractVersion(); version != "" {
+						result.Version = version
+					}
+					return result
+				}
+			}
+		}
+
+		// Check Windows services if not identified by fingerprint
 		if _, ok := windows.ServicePorts[port]; ok {
 			if service, version := windows.ProbeService(s.host, port, s.timeout); service != "" {
 				result.Service = service
@@ -180,15 +285,8 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 			}
 		}
 
-		// Check other common services
+		// Check standard ports as fallback
 		switch port {
-		case 22:
-			if service, version := services.TrySSH(address, s.timeout); service != "" {
-				result.Service = service
-				result.Version = version
-				return result
-			}
-
 		case 80, 8080, 8000, 5000:
 			if info := services.ProbeHTTP(s.host, port, s.timeout, false); info != nil {
 				result.Service = "HTTP"
@@ -211,13 +309,8 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 			}
 		}
 
-		// Try banner grab for unknown services
-		conn.SetReadDeadline(time.Now().Add(s.timeout))
-		banner := make([]byte, 1024)
-		n, _ := conn.Read(banner)
-		if n > 0 {
-			result.Banner = bytes.TrimSpace(banner[:n])
-			// Try to identify service from banner
+		// Try to identify service from banner if not already identified
+		if result.Service == "" && len(result.Banner) > 0 {
 			if service, version := identifyServiceFromBanner(result.Banner); service != "" {
 				result.Service = service
 				result.Version = version
@@ -232,7 +325,6 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 func identifyServiceFromBanner(banner []byte) (string, string) {
 	bannerStr := string(banner)
 
-	// Common banner patterns
 	if strings.Contains(bannerStr, "SSH-") {
 		parts := strings.SplitN(bannerStr, " ", 2)
 		version := ""
@@ -262,6 +354,10 @@ func identifyServiceFromBanner(banner []byte) (string, string) {
 		return "IMAP", ""
 	}
 
+	if strings.Contains(bannerStr, "MySQL") {
+		return "MySQL", ""
+	}
+
 	return "", ""
 }
 
@@ -274,18 +370,14 @@ func (s *Scanner) Scan() []models.PortResult {
 	var wg sync.WaitGroup
 	resultsMutex := sync.Mutex{}
 
-	// Channels for the scan pipeline
 	ports := make(chan uint16, s.threads*2)
 	fastScanResults := make(chan portScanResult, s.threads*2)
 
-	// Error rate tracking for dynamic rate adjustment
 	var errorRate uint64
-
-	// Progress tracking
 	totalPorts := uint64(s.endPort - s.startPort + 1)
-	scanned := uint64(0)
+	var scanned uint64
 
-	// Start fast port scanners
+	// Start port scanners
 	for i := 0; i < s.threads; i++ {
 		wg.Add(1)
 		go func() {
@@ -294,30 +386,49 @@ func (s *Scanner) Scan() []models.PortResult {
 		}()
 	}
 
-	// Feed ports to scan
+	// Feed ports in batches
 	go func() {
-		for port := s.startPort; port <= s.endPort; port++ {
-			select {
-			case ports <- port:
-			case <-ctx.Done():
-				return
+		currentPort := s.startPort
+		for currentPort <= s.endPort {
+			batchEnd := currentPort + uint16(s.batchSize)
+			if batchEnd > s.endPort {
+				batchEnd = s.endPort
 			}
+
+			for port := currentPort; port <= batchEnd; port++ {
+				select {
+				case ports <- port:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			time.Sleep(s.retryDelay) // Small delay between batches
+			currentPort = batchEnd + 1
 		}
 		close(ports)
 	}()
 
-	// Process results
+	// Process results with improved progress handling
 	go func() {
+		const progressUpdateInterval = time.Millisecond * 100
+		lastUpdate := time.Now()
+		lastPercentage := float64(0)
+
 		for result := range fastScanResults {
-			atomic.AddUint64(&scanned, 1)
-			progress := float64(atomic.LoadUint64(&scanned)) / float64(totalPorts) * 100
-			select {
-			case s.progress <- progress:
-			default:
+			newScanned := atomic.AddUint64(&scanned, 1)
+			now := time.Now()
+			// Calculate current progress
+			currentProgress := float64(newScanned) / float64(totalPorts) * 100
+			// Update progress if enough time has passed or it's a significant change
+			if now.Sub(lastUpdate) >= progressUpdateInterval ||
+				currentProgress-lastPercentage >= 1.0 {
+				s.updateProgress(currentProgress)
+				lastUpdate = now
+				lastPercentage = currentProgress
 			}
 
 			if result.isOpen {
-				// Validate and get service info
 				fullResult := s.validatePort(result.port, result.response)
 				if fullResult.State == "open" {
 					resultsMutex.Lock()
@@ -326,11 +437,14 @@ func (s *Scanner) Scan() []models.PortResult {
 				}
 			}
 		}
+		s.updateProgress(100)
 	}()
 
-	// Wait for scan completion
 	wg.Wait()
 	close(fastScanResults)
+
+	// Ensure final progress update
+	s.updateProgress(100)
 	close(s.progress)
 
 	// Sort results by port number
