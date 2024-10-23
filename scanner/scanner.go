@@ -1,47 +1,39 @@
 package scanner
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"GoKnocker/display"
 	"GoKnocker/models"
 	"GoKnocker/services"
 	"GoKnocker/services/windows"
+	"GoKnocker/stats"
 )
 
 type Scanner struct {
-	host          string
-	startPort     uint16
-	endPort       uint16
-	timeout       time.Duration
-	rateLimit     time.Duration
-	threads       int
-	debug         bool
-	results       chan models.PortResult
-	progress      chan float64
-	maxRetries    int
-	adjustRate    bool
-	minRateLimit  time.Duration
-	maxRateLimit  time.Duration
-	retryDelay    time.Duration
-	batchSize     int
-	earlyTimeout  time.Duration
-	progressMutex sync.Mutex
-	lastProgress  float64
-}
-
-type portScanResult struct {
-	port     uint16
-	isOpen   bool
-	response time.Duration
-	attempts int
+	host         string
+	startPort    uint16
+	endPort      uint16
+	timeout      time.Duration
+	rateLimit    time.Duration
+	threads      int
+	debug        bool
+	maxRetries   int
+	adjustRate   bool
+	minRateLimit time.Duration
+	maxRateLimit time.Duration
+	retryDelay   time.Duration
+	batchSize    int
+	earlyTimeout time.Duration
+	stats        *stats.ScanStats
+	display      *display.ProgressDisplay
+	detailed     bool
 }
 
 func NewScanner() *Scanner {
@@ -51,84 +43,40 @@ func NewScanner() *Scanner {
 		timeout:      time.Second * 2,
 		rateLimit:    time.Millisecond, // 1000 scans per second default
 		threads:      500,
-		maxRetries:   3, // Multiple validation attempts
+		maxRetries:   3,
 		adjustRate:   true,
-		minRateLimit: time.Millisecond,       // Max 1000 scans per second
-		maxRateLimit: time.Millisecond * 10,  // Min 100 scans per second
-		retryDelay:   time.Millisecond * 100, // Delay between retries
-		batchSize:    1000,                   // Process ports in batches
-		earlyTimeout: time.Millisecond * 500, // Quick initial check timeout
-		results:      make(chan models.PortResult),
-		progress:     make(chan float64, 100), // Buffered progress channel
+		minRateLimit: time.Millisecond,      // Max 1000 scans per second
+		maxRateLimit: time.Millisecond * 10, // Min 100 scans per second
+		retryDelay:   time.Millisecond * 100,
+		batchSize:    1000,
+		earlyTimeout: time.Millisecond * 500,
+		detailed:     false,
 	}
 }
 
 // Setter methods
-func (s *Scanner) SetHost(host string) {
-	s.host = host
-}
-
-func (s *Scanner) SetStartPort(port uint16) {
-	s.startPort = port
-}
-
-func (s *Scanner) SetEndPort(port uint16) {
-	s.endPort = port
-}
-
-func (s *Scanner) SetRateLimit(rate time.Duration) {
-	s.rateLimit = rate
-}
-
-func (s *Scanner) SetTimeout(timeout time.Duration) {
-	s.timeout = timeout
-	s.earlyTimeout = timeout / 4
-}
-
-func (s *Scanner) SetThreads(threads int) {
-	s.threads = threads
-}
+func (s *Scanner) SetHost(host string)              { s.host = host }
+func (s *Scanner) SetStartPort(port uint16)         { s.startPort = port }
+func (s *Scanner) SetEndPort(port uint16)           { s.endPort = port }
+func (s *Scanner) SetRateLimit(rate time.Duration)  { s.rateLimit = rate }
+func (s *Scanner) SetTimeout(timeout time.Duration) { s.timeout = timeout }
+func (s *Scanner) SetThreads(threads int)           { s.threads = threads }
+func (s *Scanner) EnableDetailedStats(enabled bool) { s.detailed = enabled }
 
 // Getter methods
-func (s *Scanner) GetHost() string {
-	return s.host
-}
-
-func (s *Scanner) GetStartPort() uint16 {
-	return s.startPort
-}
-
-func (s *Scanner) GetEndPort() uint16 {
-	return s.endPort
-}
-
-func (s *Scanner) GetRateLimit() time.Duration {
-	return s.rateLimit
-}
-
-func (s *Scanner) GetProgressChan() chan float64 {
-	return s.progress
-}
-
-// updateProgress ensures monotonic progress updates
-func (s *Scanner) updateProgress(progress float64) {
-	s.progressMutex.Lock()
-	defer s.progressMutex.Unlock()
-
-	if progress > s.lastProgress {
-		s.lastProgress = progress
-		select {
-		case s.progress <- progress:
-		default:
-		}
-	}
-}
+func (s *Scanner) GetHost() string             { return s.host }
+func (s *Scanner) GetStartPort() uint16        { return s.startPort }
+func (s *Scanner) GetEndPort() uint16          { return s.endPort }
+func (s *Scanner) GetRateLimit() time.Duration { return s.rateLimit }
+func (s *Scanner) GetStats() *stats.ScanStats  { return s.stats }
 
 // fastPortScan performs quick initial port scanning
-func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results chan<- portScanResult, errorRate *uint64) {
+func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results chan<- models.PortResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	dialer := &net.Dialer{
 		Timeout:   s.earlyTimeout,
-		KeepAlive: -1, // Disable keep-alive
+		KeepAlive: -1,
 	}
 
 	for port := range ports {
@@ -136,58 +84,35 @@ func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results c
 		case <-ctx.Done():
 			return
 		default:
-			var isOpen bool
-			var bestResponse time.Duration
-			attempts := 0
+			start := time.Now()
+			conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.host, port))
 
-			// Multiple quick checks for consistency
-			for i := 0; i < 2; i++ {
-				attempts++
-				start := time.Now()
-				conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.host, port))
-
-				if err == nil {
-					conn.Close()
-					isOpen = true
-					response := time.Since(start)
-					if bestResponse == 0 || response < bestResponse {
-						bestResponse = response
-					}
-					break // Success, no need for more attempts
-				} else {
-					if !strings.Contains(err.Error(), "refused") {
-						atomic.AddUint64(errorRate, 1)
-					}
-					// If connection was refused, it's definitely closed
-					if strings.Contains(err.Error(), "refused") {
-						break
-					}
+			if err == nil {
+				conn.Close()
+				results <- models.PortResult{
+					IP:           net.ParseIP(s.host),
+					Port:         port,
+					State:        "open",
+					ResponseTime: time.Since(start),
 				}
-
-				if i < 1 { // Don't sleep after last attempt
-					time.Sleep(s.retryDelay / 2)
-				}
+			} else if strings.Contains(err.Error(), "refused") {
+				s.stats.UpdatePortStatus("closed")
+			} else {
+				s.stats.UpdatePortStatus("filtered")
+				s.stats.UpdateError()
 			}
 
-			if isOpen {
-				results <- portScanResult{
-					port:     port,
-					isOpen:   true,
-					response: bestResponse,
-					attempts: attempts,
-				}
-			}
+			s.stats.IncrementScanned()
 
-			// Dynamic rate limiting with error rate consideration
+			// Dynamic rate limiting
 			if s.adjustRate {
-				errorRateValue := atomic.LoadUint64(errorRate)
-				if errorRateValue > uint64(s.threads/2) {
-					atomic.StoreUint64(errorRate, 0)
+				errorCount := s.stats.GetErrorCount()
+				if errorCount > uint64(s.threads/2) {
 					newRate := s.rateLimit * 2
 					if newRate <= s.maxRateLimit {
 						s.rateLimit = newRate
 					}
-				} else if errorRateValue == 0 && s.rateLimit > s.minRateLimit {
+				} else if errorCount == 0 && s.rateLimit > s.minRateLimit {
 					newRate := s.rateLimit / 2
 					if newRate >= s.minRateLimit {
 						s.rateLimit = newRate
@@ -201,256 +126,165 @@ func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results c
 }
 
 // validatePort performs thorough port validation and service detection
-func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) models.PortResult {
-	result := models.PortResult{
-		IP:           net.ParseIP(s.host),
-		Port:         port,
-		State:        "closed",
-		ResponseTime: initialResponse,
-	}
+func (s *Scanner) validatePort(result *models.PortResult) {
+	s.stats.SetPhase("Service Detection")
 
-	var successfulProbe bool
-
-	// Multiple validation attempts
-	for attempt := 0; attempt < s.maxRetries && !successfulProbe; attempt++ {
-		address := fmt.Sprintf("%s:%d", s.host, port)
+	for attempt := 0; attempt < s.maxRetries; attempt++ {
+		address := fmt.Sprintf("%s:%d", s.host, result.Port)
 		conn, err := net.DialTimeout("tcp", address, s.timeout)
+
 		if err != nil {
 			if strings.Contains(err.Error(), "refused") {
 				result.State = "filtered"
 			}
+			s.stats.UpdateRetry()
 			if attempt < s.maxRetries-1 {
 				time.Sleep(s.retryDelay)
 			}
 			continue
 		}
 
-		result.State = "open"
 		defer conn.Close()
-		successfulProbe = true
-
-		// Get initial banner for protocol detection
 		banner := make([]byte, 1024)
 		conn.SetReadDeadline(time.Now().Add(s.timeout))
 		n, _ := conn.Read(banner)
 
 		if n > 0 {
-			result.Banner = bytes.TrimSpace(banner[:n])
-
-			// Try to identify service based on protocol fingerprint
-			fingerprint := services.NewFingerprint(banner[:n])
-			if protocol := fingerprint.IdentifyProtocol(); protocol != "" {
-				switch protocol {
-				case "HTTP":
-					if info := services.ProbeHTTP(s.host, port, s.timeout, false); info != nil {
-						result.Service = "HTTP"
-						result.HttpInfo = info
-						if info.Server != "" {
-							result.Version = info.Server
-						}
-						return result
-					}
-
-				case "SSH":
-					if service, version := services.TrySSH(address, s.timeout); service != "" {
-						result.Service = service
-						result.Version = version
-						return result
-					}
-
-				case "SMB", "LDAP", "DNS", "RPC":
-					if service, version := windows.ProbeService(s.host, port, s.timeout); service != "" {
-						result.Service = service
-						result.Version = version
-						return result
-					}
-
-				default:
-					// For other identified protocols, at least set the service name
-					result.Service = protocol
-					if version := fingerprint.ExtractVersion(); version != "" {
-						result.Version = version
-					}
-					return result
-				}
+			result.Banner = banner[:n]
+			if s.identifyService(result) {
+				s.stats.UpdateServiceFound()
+				return
 			}
 		}
 
-		// Check Windows services if not identified by fingerprint
-		if _, ok := windows.ServicePorts[port]; ok {
-			if service, version := windows.ProbeService(s.host, port, s.timeout); service != "" {
-				result.Service = service
-				result.Version = version
-				return result
-			}
+		// Check Windows services
+		if s.checkWindowsServices(result) {
+			s.stats.UpdateServiceFound()
+			return
 		}
 
-		// Check standard ports as fallback
-		switch port {
-		case 80, 8080, 8000, 5000:
-			if info := services.ProbeHTTP(s.host, port, s.timeout, false); info != nil {
+		// Check common ports
+		if s.checkCommonPorts(result) {
+			s.stats.UpdateServiceFound()
+			return
+		}
+	}
+}
+
+func (s *Scanner) identifyService(result *models.PortResult) bool {
+	fingerprint := services.NewFingerprint(result.Banner)
+	if protocol := fingerprint.IdentifyProtocol(); protocol != "" {
+		switch protocol {
+		case "HTTP":
+			if info := services.ProbeHTTP(s.host, result.Port, s.timeout, false); info != nil {
 				result.Service = "HTTP"
 				result.HttpInfo = info
 				if info.Server != "" {
 					result.Version = info.Server
 				}
-				return result
+				return true
 			}
-
-		case 443, 8443:
-			if info, enhanced := services.ProbeHTTPS(s.host, port, s.timeout); info != nil {
-				result.Service = "HTTPS"
-				result.HttpInfo = info
-				result.EnhancedInfo = enhanced
-				if info.Server != "" {
-					result.Version = info.Server
-				}
-				return result
-			}
-		}
-
-		// Try to identify service from banner if not already identified
-		if result.Service == "" && len(result.Banner) > 0 {
-			if service, version := identifyServiceFromBanner(result.Banner); service != "" {
+		case "SSH":
+			if service, version := services.TrySSH(fmt.Sprintf("%s:%d", s.host, result.Port), s.timeout); service != "" {
 				result.Service = service
 				result.Version = version
+				return true
 			}
 		}
+		result.Service = protocol
+		result.Version = fingerprint.ExtractVersion()
+		return true
 	}
-
-	return result
+	return false
 }
 
-// identifyServiceFromBanner attempts to identify service based on banner
-func identifyServiceFromBanner(banner []byte) (string, string) {
-	bannerStr := string(banner)
+func (s *Scanner) checkWindowsServices(result *models.PortResult) bool {
+	if service, version := windows.ProbeService(s.host, result.Port, s.timeout); service != "" {
+		result.Service = service
+		result.Version = version
+		return true
+	}
+	return false
+}
 
-	if strings.Contains(bannerStr, "SSH-") {
-		parts := strings.SplitN(bannerStr, " ", 2)
-		version := ""
-		if len(parts) > 1 {
-			version = strings.TrimSpace(parts[1])
+func (s *Scanner) checkCommonPorts(result *models.PortResult) bool {
+	switch result.Port {
+	case 80, 8080, 8000, 5000:
+		if info := services.ProbeHTTP(s.host, result.Port, s.timeout, false); info != nil {
+			result.Service = "HTTP"
+			result.HttpInfo = info
+			if info.Server != "" {
+				result.Version = info.Server
+			}
+			return true
 		}
-		return "SSH", version
+	case 443, 8443:
+		if info, enhanced := services.ProbeHTTPS(s.host, result.Port, s.timeout); info != nil {
+			result.Service = "HTTPS"
+			result.HttpInfo = info
+			result.EnhancedInfo = enhanced
+			if info.Server != "" {
+				result.Version = info.Server
+			}
+			return true
+		}
 	}
-
-	if strings.Contains(bannerStr, "HTTP") {
-		return "HTTP", ""
-	}
-
-	if strings.Contains(bannerStr, "FTP") {
-		return "FTP", ""
-	}
-
-	if strings.Contains(bannerStr, "SMTP") {
-		return "SMTP", ""
-	}
-
-	if strings.Contains(bannerStr, "POP3") {
-		return "POP3", ""
-	}
-
-	if strings.Contains(bannerStr, "IMAP") {
-		return "IMAP", ""
-	}
-
-	if strings.Contains(bannerStr, "MySQL") {
-		return "MySQL", ""
-	}
-
-	return "", ""
+	return false
 }
 
-// Scan performs the complete port scanning process
 func (s *Scanner) Scan() []models.PortResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var results []models.PortResult
-	var wg sync.WaitGroup
-	resultsMutex := sync.Mutex{}
-
-	ports := make(chan uint16, s.threads*2)
-	fastScanResults := make(chan portScanResult, s.threads*2)
-
-	var errorRate uint64
 	totalPorts := uint64(s.endPort - s.startPort + 1)
-	var scanned uint64
+	s.stats = stats.NewScanStats(totalPorts, s.detailed)
+	s.display = display.NewProgressDisplay(s.stats)
 
-	// Start port scanners
+	// Start progress display
+	go s.display.Start()
+	defer s.display.Stop()
+
+	resultsChan := make(chan models.PortResult, s.threads)
+	ports := make(chan uint16, s.threads*2)
+
+	// Start worker pool for fast scanning
+	var wg sync.WaitGroup
 	for i := 0; i < s.threads; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.fastPortScan(ctx, ports, fastScanResults, &errorRate)
-		}()
+		go s.fastPortScan(ctx, ports, resultsChan, &wg)
 	}
 
 	// Feed ports in batches
 	go func() {
-		currentPort := s.startPort
-		for currentPort <= s.endPort {
-			batchEnd := currentPort + uint16(s.batchSize)
-			if batchEnd > s.endPort {
-				batchEnd = s.endPort
+		for port := s.startPort; port <= s.endPort; port++ {
+			select {
+			case ports <- port:
+			case <-ctx.Done():
+				return
 			}
-
-			for port := currentPort; port <= batchEnd; port++ {
-				select {
-				case ports <- port:
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			time.Sleep(s.retryDelay) // Small delay between batches
-			currentPort = batchEnd + 1
 		}
 		close(ports)
 	}()
 
-	// Process results with improved progress handling
+	// Collect results
 	go func() {
-		const progressUpdateInterval = time.Millisecond * 100
-		lastUpdate := time.Now()
-		lastPercentage := float64(0)
-
-		for result := range fastScanResults {
-			newScanned := atomic.AddUint64(&scanned, 1)
-			now := time.Now()
-			// Calculate current progress
-			currentProgress := float64(newScanned) / float64(totalPorts) * 100
-			// Update progress if enough time has passed or it's a significant change
-			if now.Sub(lastUpdate) >= progressUpdateInterval ||
-				currentProgress-lastPercentage >= 1.0 {
-				s.updateProgress(currentProgress)
-				lastUpdate = now
-				lastPercentage = currentProgress
-			}
-
-			if result.isOpen {
-				fullResult := s.validatePort(result.port, result.response)
-				if fullResult.State == "open" {
-					resultsMutex.Lock()
-					results = append(results, fullResult)
-					resultsMutex.Unlock()
-				}
-			}
-		}
-		s.updateProgress(100)
+		wg.Wait()
+		close(resultsChan)
 	}()
 
-	wg.Wait()
-	close(fastScanResults)
-
-	// Ensure final progress update
-	s.updateProgress(100)
-	close(s.progress)
+	// Process results and perform service detection
+	var openPorts []models.PortResult
+	for result := range resultsChan {
+		if result.State == "open" {
+			s.validatePort(&result)
+			openPorts = append(openPorts, result)
+		}
+	}
 
 	// Sort results by port number
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Port < results[j].Port
+	sort.Slice(openPorts, func(i, j int) bool {
+		return openPorts[i].Port < openPorts[j].Port
 	})
 
-	return results
+	return openPorts
 }
