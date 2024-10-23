@@ -25,5 +25,6 @@ type PortResult struct {
 	Version      string
 	Banner       []byte
 	HttpInfo     *HttpInfo
+	EnhancedInfo map[string]interface{}
 	ResponseTime time.Duration
 }
