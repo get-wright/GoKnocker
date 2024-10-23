@@ -11,6 +11,7 @@ import (
 
 	"GoKnocker/models"
 	"GoKnocker/scanner"
+	"GoKnocker/services"
 )
 
 func main() {
@@ -121,11 +122,56 @@ func main() {
 				if result.HttpInfo.Location != "" {
 					fmt.Printf("    Redirect: %s\n", result.HttpInfo.Location)
 				}
-				if result.HttpInfo.TLSVersion != "" {
-					fmt.Printf("    TLS Version: %s\n", result.HttpInfo.TLSVersion)
-					fmt.Printf("    TLS Cipher: %s\n", result.HttpInfo.TLSCipher)
-					if result.HttpInfo.TLSCert != "" {
-						fmt.Printf("    TLS Certificate: %s\n", result.HttpInfo.TLSCert)
+
+				// Enhanced HTTPS information
+				if result.Service == "HTTPS" && result.EnhancedInfo != nil {
+					// Print supported HTTP methods
+					if methods, ok := result.EnhancedInfo["methods"].([]string); ok && len(methods) > 0 {
+						fmt.Printf("    Supported Methods: %s\n", strings.Join(methods, ", "))
+					}
+
+					// Print security headers
+					if secHeaders, ok := result.EnhancedInfo["security_headers"].(map[string]string); ok && len(secHeaders) > 0 {
+						fmt.Printf("    Security Headers:\n")
+						for header, value := range secHeaders {
+							fmt.Printf("      %s: %s\n", header, value)
+						}
+					}
+
+					// Print TLS information
+					if result.HttpInfo.TLSVersion != "" {
+						fmt.Printf("    TLS Info:\n")
+						fmt.Printf("      Version: %s\n", result.HttpInfo.TLSVersion)
+						fmt.Printf("      Cipher: %s\n", result.HttpInfo.TLSCipher)
+
+						if fingerprint, ok := result.EnhancedInfo["tls_fingerprint"].(string); ok {
+							fmt.Printf("      Fingerprint: %s\n", fingerprint)
+						}
+					}
+
+					// Print certificate chain information
+					if certChain, ok := result.EnhancedInfo["certificate_chain"].([]services.CertInfo); ok && len(certChain) > 0 {
+						fmt.Printf("    Certificate Chain:\n")
+						for i, cert := range certChain {
+							fmt.Printf("      Certificate %d:\n", i+1)
+							fmt.Printf("        Subject: %s\n", cert.Subject)
+							fmt.Printf("        Issuer: %s\n", cert.Issuer)
+							fmt.Printf("        Valid From: %s\n", cert.ValidFrom.Format("2006-01-02"))
+							fmt.Printf("        Valid To: %s\n", cert.ValidTo.Format("2006-01-02"))
+							if len(cert.SubjectAltNames) > 0 {
+								fmt.Printf("        Subject Alternative Names:\n")
+								for _, san := range cert.SubjectAltNames {
+									fmt.Printf("          - %s\n", san)
+								}
+							}
+						}
+					}
+
+					// Print server information
+					if serverInfo, ok := result.EnhancedInfo["server_info"].(services.ServerInfo); ok {
+						if serverInfo.Technology != "" {
+							fmt.Printf("    Technology Stack: %s\n", serverInfo.Technology)
+						}
 					}
 				}
 			}

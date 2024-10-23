@@ -117,11 +117,17 @@ func (s *Scanner) scanPort(port uint16) models.PortResult {
 			}
 
 		case 443, 8443:
-			if info := services.ProbeHTTP(s.host, port, s.timeout, true); info != nil {
+			// Updated HTTPS probing
+			if baseInfo, enhancedInfo := services.ProbeHTTPS(s.host, port, s.timeout); baseInfo != nil {
 				result.Service = "HTTPS"
-				result.HttpInfo = info
-				if info.Server != "" {
-					result.Version = info.Server
+				result.HttpInfo = baseInfo
+				result.EnhancedInfo = enhancedInfo
+
+				// Try to get server version from enhanced info
+				if serverInfo, ok := enhancedInfo["server_info"].(services.ServerInfo); ok && serverInfo.Version != "" {
+					result.Version = serverInfo.Version
+				} else if baseInfo.Server != "" {
+					result.Version = baseInfo.Server
 				}
 				return result
 			}
