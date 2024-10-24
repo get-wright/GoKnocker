@@ -54,7 +54,6 @@ func (s *ScanStats) UpdatePortStatus(status string) {
 	}
 }
 
-// UpdateServiceFound increments the services found counter
 func (s *ScanStats) UpdateServiceFound() {
 	atomic.AddUint64(&s.servicesFound, 1)
 }
