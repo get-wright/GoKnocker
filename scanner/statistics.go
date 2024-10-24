@@ -47,10 +47,10 @@ func (s *ScanStatistics) UpdateProgress(scannedPorts uint64, currentPort uint16)
 	// Update scan rate every second
 	now := time.Now()
 	if now.Sub(s.lastUpdate) >= time.Second {
-		portDelta := s.PortsScanned - s.lastPortCount
+		portDelta := float64(s.PortsScanned - s.lastPortCount)
 		timeDelta := now.Sub(s.lastUpdate).Seconds()
 		if timeDelta > 0 {
-			s.scanRate = float64(portDelta) / timeDelta
+			s.scanRate = portDelta / timeDelta
 		}
 		s.lastUpdate = now
 		s.lastPortCount = s.PortsScanned
@@ -111,32 +111,29 @@ func (s *ScanStatistics) String() string {
 
 	var b strings.Builder
 
-	// Calculate progress bar with bounds checking
+	// Clear entire display area first
+	b.WriteString("\033[2J\033[H") // Clear screen and move to top
+
+	// Calculate progress bar
 	progress := s.GetProgress()
 	width := 40
-	// Ensure progress is between 0 and 100
-	progress = math.Max(0, math.Min(100, progress))
-	complete := int(progress * float64(width) / 100)
-	// Ensure complete is between 0 and width
-	complete = int(math.Max(0, math.Min(float64(width), float64(complete))))
+	complete := int(math.Max(0, math.Min(float64(width), progress*float64(width)/100)))
 	remaining := width - complete
 
-	// Progress bar with validated values
-	b.WriteString(fmt.Sprintf("\033[2K\rProgress: [%s%s] %.1f%%\n",
+	// Progress bar
+	b.WriteString(fmt.Sprintf("Progress: [%s%s] %.1f%%\n",
 		strings.Repeat("=", complete),
 		strings.Repeat(" ", remaining),
 		progress))
 
-	// Scan time and current status
+	// Scan status with clear formatting
 	elapsed := time.Since(s.StartTime).Round(time.Second)
-	b.WriteString(fmt.Sprintf("Scan Time: %v\n", elapsed))
+	b.WriteString(fmt.Sprintf("\nScan Time: %v\n", elapsed))
 	b.WriteString(fmt.Sprintf("Current Port: %d\n", s.CurrentPort))
 
-	// Ports scanned with rate
+	// Scanning statistics
 	b.WriteString(fmt.Sprintf("Ports Scanned: %d/%d (%.0f ports/sec)\n",
 		s.PortsScanned, s.TotalPorts, s.scanRate))
-
-	// Open ports count
 	b.WriteString(fmt.Sprintf("Open Ports Found: %d\n", s.OpenPorts))
 
 	// Service distribution
@@ -159,16 +156,16 @@ func (s *ScanStatistics) String() string {
 		})
 
 		for _, svc := range services {
-			b.WriteString(fmt.Sprintf("  %-10s: %d\n", svc.name, svc.count))
+			b.WriteString(fmt.Sprintf("  %-15s: %d\n", svc.name, svc.count))
 		}
 	}
 
-	// Average response time
+	// Performance metrics
 	if len(s.ResponseTimes) > 0 {
 		b.WriteString(fmt.Sprintf("\nAverage Response Time: %v\n", s.GetAverageResponseTime()))
 	}
 
-	// Error count if any
+	// Error information
 	if s.ErrorCount > 0 {
 		b.WriteString(fmt.Sprintf("Errors Encountered: %d\n", s.ErrorCount))
 	}
@@ -178,14 +175,9 @@ func (s *ScanStatistics) String() string {
 
 // Improve progress calculation
 func (s *ScanStatistics) GetProgress() float64 {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
 	if s.TotalPorts == 0 {
 		return 0
 	}
-
 	progress := float64(s.PortsScanned) / float64(s.TotalPorts) * 100
-	// Ensure progress is between 0 and 100
 	return math.Max(0, math.Min(100, progress))
 }

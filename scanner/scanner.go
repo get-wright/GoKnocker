@@ -124,23 +124,23 @@ func (s *Scanner) printStatistics(ctx context.Context) {
 	ticker := time.NewTicker(s.statInterval)
 	defer ticker.Stop()
 
-	// Save cursor position and hide it
-	fmt.Print("\033[s\033[?25l")
-	defer fmt.Print("\033[u\033[?25h") // Restore cursor position and show it
+	// Hide cursor
+	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h") // Show cursor on exit
+
+	// Clear screen once at the start
+	fmt.Print("\033[2J\033[H")
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Move cursor up by the number of lines in the stats
-			fmt.Print("\033[2K") // Clear line
-			stats := s.stats.String()
-			numLines := strings.Count(stats, "\n") + 1
-			if numLines > 0 {
-				fmt.Printf("\033[%dA", numLines) // Move cursor up
-			}
-			fmt.Print(stats)
+			// Print statistics
+			fmt.Print(s.stats.String())
+
+			// Move cursor back to top
+			fmt.Print("\033[H")
 		}
 	}
 }
