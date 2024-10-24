@@ -303,8 +303,15 @@ func (s *Scanner) Scan() []models.PortResult {
 	totalPorts := uint64(s.endPort - s.startPort + 1)
 	s.stats = NewScanStatistics(totalPorts)
 
+	// Initialize error rate counter
+	var errorRate uint64
+
 	// Start statistics printer
-	go s.printStatistics(ctx)
+	statsDone := make(chan struct{})
+	go func() {
+		s.printStatistics(ctx)
+		close(statsDone)
+	}()
 
 	var results []models.PortResult
 	var wg sync.WaitGroup
@@ -312,8 +319,7 @@ func (s *Scanner) Scan() []models.PortResult {
 
 	ports := make(chan uint16, s.threads*2)
 	fastScanResults := make(chan portScanResult, s.threads*2)
-
-	var errorRate uint64
+	done := make(chan struct{})
 
 	// Start port scanners
 	for i := 0; i < s.threads; i++ {
@@ -359,10 +365,19 @@ func (s *Scanner) Scan() []models.PortResult {
 				}
 			}
 		}
+		close(done)
 	}()
 
+	// Wait for all scanners to complete
 	wg.Wait()
 	close(fastScanResults)
+
+	// Wait for result processing to complete
+	<-done
+
+	// Cancel statistics printing and wait for it to finish
+	cancel()
+	<-statsDone
 
 	// Sort results by port number
 	sort.Slice(results, func(i, j int) bool {
@@ -373,5 +388,7 @@ func (s *Scanner) Scan() []models.PortResult {
 	s.stats.UpdateProgress(totalPorts, s.endPort)
 	close(s.progress)
 
+	// Print final summary
+	fmt.Print("\n\n") // Add some spacing after the progress display
 	return results
 }

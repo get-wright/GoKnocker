@@ -264,31 +264,40 @@ func startScan(s *scanner.Scanner, sigChan chan os.Signal) []models.PortResult {
 }
 
 func printResults(results []models.PortResult) {
-	fmt.Printf("\n\033[1mScan Results:\033[0m\n")
-	fmt.Printf("Found \033[1;32m%d\033[0m open ports\n\n", len(results))
-
 	if len(results) == 0 {
-		fmt.Println("\033[33mNo open ports found\033[0m")
+		fmt.Println("\n\033[1;33mNo open ports found\033[0m")
 		return
 	}
 
+	fmt.Printf("\n\033[1mScan Results:\033[0m\n")
+	fmt.Printf("Found \033[1;32m%d\033[0m open ports\n\n", len(results))
+
 	// Print results in a table format
-	fmt.Println("\033[1mPORT      STATE    SERVICE    VERSION    RESPONSE TIME\033[0m")
+	fmt.Println("\033[1mPORT      STATE    SERVICE    VERSION\033[0m")
 	fmt.Println(strings.Repeat("-", 70))
 
 	for _, result := range results {
 		// Basic port information
-		fmt.Printf("%-9d %-8s %-10s %-10s %v\n",
+		fmt.Printf("%-9d %-8s %-10s %s\n",
 			result.Port,
 			formatState(result.State),
 			formatService(result.Service),
-			truncateString(result.Version, 10),
-			result.ResponseTime)
+			truncateString(result.Version, 40))
+
+		// Print banner if available and not empty
+		if len(result.Banner) > 0 {
+			banner := formatBanner(string(result.Banner))
+			if banner != "" {
+				fmt.Printf("└─ Banner: %s\n", banner)
+			}
+		}
 
 		// HTTP Information
 		if result.HttpInfo != nil {
 			fmt.Printf("└─ HTTP Info:\n")
-			fmt.Printf("   ├─ Status: %d\n", result.HttpInfo.StatusCode)
+			if result.HttpInfo.StatusCode != 0 {
+				fmt.Printf("   ├─ Status: %d\n", result.HttpInfo.StatusCode)
+			}
 			if result.HttpInfo.Title != "" {
 				fmt.Printf("   ├─ Title: %s\n", result.HttpInfo.Title)
 			}
@@ -296,26 +305,31 @@ func printResults(results []models.PortResult) {
 				fmt.Printf("   ├─ Server: %s\n", result.HttpInfo.Server)
 			}
 			if result.HttpInfo.PoweredBy != "" {
-				fmt.Printf("   ├─ Powered By: %s\n", result.HttpInfo.PoweredBy)
-			}
-
-			// TLS Information for HTTPS
-			if result.Service == "HTTPS" && result.HttpInfo.TLSVersion != "" {
-				fmt.Printf("   └─ TLS Info:\n")
-				fmt.Printf("      ├─ Version: %s\n", result.HttpInfo.TLSVersion)
-				fmt.Printf("      ├─ Cipher: %s\n", result.HttpInfo.TLSCipher)
-				if result.HttpInfo.TLSCert != "" {
-					fmt.Printf("      └─ Certificate: %s\n", result.HttpInfo.TLSCert)
-				}
+				fmt.Printf("   └─ Powered By: %s\n", result.HttpInfo.PoweredBy)
 			}
 		}
 
-		// Print banner if available
-		if len(result.Banner) > 0 {
-			fmt.Printf("└─ Banner: %s\n", formatBanner(string(result.Banner)))
+		// TLS Information
+		if result.HttpInfo != nil && result.HttpInfo.TLSVersion != "" {
+			fmt.Printf("└─ TLS Info:\n")
+			fmt.Printf("   ├─ Version: %s\n", result.HttpInfo.TLSVersion)
+			fmt.Printf("   ├─ Cipher: %s\n", result.HttpInfo.TLSCipher)
+			if result.HttpInfo.TLSCert != "" {
+				fmt.Printf("   └─ Certificate: %s\n", result.HttpInfo.TLSCert)
+			}
 		}
 
 		fmt.Println()
+	}
+
+	// Print enhanced service information if available
+	for _, result := range results {
+		if result.EnhancedInfo != nil && len(result.EnhancedInfo) > 0 {
+			fmt.Printf("\n\033[1mEnhanced Information for port %d:\033[0m\n", result.Port)
+			for key, value := range result.EnhancedInfo {
+				fmt.Printf("  %s: %v\n", key, value)
+			}
+		}
 	}
 }
 
@@ -373,12 +387,18 @@ func truncateString(s string, length int) string {
 }
 
 func formatBanner(banner string) string {
-	// Remove non-printable characters and trim spaces
-	banner = strings.Map(func(r rune) rune {
-		if r < 32 || r > 126 {
-			return ' '
+	// Remove non-printable characters except newlines and tabs
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || (r >= 32 && r <= 126) {
+			return r
 		}
-		return r
+		return -1
 	}, banner)
-	return strings.TrimSpace(banner)
+
+	// Trim spaces and limit length
+	cleaned = strings.TrimSpace(cleaned)
+	if len(cleaned) > 100 {
+		cleaned = cleaned[:97] + "..."
+	}
+	return cleaned
 }
