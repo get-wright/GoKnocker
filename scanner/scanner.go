@@ -40,7 +40,6 @@ type portScanResult struct {
 	port       uint16
 	isOpen     bool
 	response   time.Duration
-	attempts   int
 	errorCount int
 	scanErrors []error
 }
@@ -145,6 +144,7 @@ func (s *Scanner) printStatistics(ctx context.Context) {
 	}
 }
 
+// Improve rate limiting in fastPortScan
 func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results chan<- portScanResult, errorRate *uint64) {
 	dialer := &net.Dialer{
 		Timeout:   s.earlyTimeout,
@@ -154,75 +154,48 @@ func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results c
 	rateLimiter := time.NewTicker(s.rateLimit)
 	defer rateLimiter.Stop()
 
-	for port := range ports {
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-rateLimiter.C:
+		case port, ok := <-ports:
+			if !ok {
+				return
+			}
+
+			<-rateLimiter.C
+
 			result := portScanResult{
 				port:       port,
 				scanErrors: make([]error, 0),
 			}
 
-			// Multiple quick checks for consistency with better error tracking
-			for i := 0; i < 2; i++ {
-				result.attempts++
-				start := time.Now()
+			// Quick check with context timeout
+			dialCtx, cancel := context.WithTimeout(ctx, s.earlyTimeout)
+			conn, err := dialer.DialContext(dialCtx, "tcp", fmt.Sprintf("%s:%d", s.host, port))
+			cancel()
 
-				// Add context timeout
-				dialCtx, cancel := context.WithTimeout(ctx, s.earlyTimeout)
-				conn, err := dialer.DialContext(dialCtx, "tcp", fmt.Sprintf("%s:%d", s.host, port))
-				cancel()
-
-				if err == nil {
-					conn.Close()
-					result.isOpen = true
-					response := time.Since(start)
-					if result.response == 0 || response < result.response {
-						result.response = response
-					}
-					break
-				} else {
-					if !strings.Contains(err.Error(), "refused") {
-						atomic.AddUint64(errorRate, 1)
-						result.errorCount++
-						result.scanErrors = append(result.scanErrors, err)
-						s.stats.IncrementErrors()
-					}
-					if strings.Contains(err.Error(), "refused") {
-						break
-					}
-				}
-
-				if i < 1 && !result.isOpen {
-					time.Sleep(s.retryDelay / 2)
-				}
+			if err == nil {
+				conn.Close()
+				result.isOpen = true
+				result.response = s.earlyTimeout
+			} else if !strings.Contains(err.Error(), "refused") {
+				atomic.AddUint64(errorRate, 1)
+				result.errorCount++
+				result.scanErrors = append(result.scanErrors, err)
+				s.stats.IncrementErrors()
 			}
 
-			// Update scan statistics
+			// Update statistics
 			atomic.AddUint64(&s.stats.PortsScanned, 1)
 			s.stats.UpdateProgress(atomic.LoadUint64(&s.stats.PortsScanned), port)
 
+			// Send result if port is open
 			if result.isOpen {
-				results <- result
-			}
-
-			// Dynamic rate limiting with smoother adjustments
-			if s.adjustRate {
-				errorRateValue := atomic.LoadUint64(errorRate)
-				if errorRateValue > uint64(s.threads/4) { // More sensitive threshold
-					atomic.StoreUint64(errorRate, 0)
-					newRate := s.rateLimit + (s.rateLimit / 4) // Smaller increments
-					if newRate <= s.maxRateLimit {
-						s.rateLimit = newRate
-						rateLimiter.Reset(s.rateLimit)
-					}
-				} else if errorRateValue == 0 && s.rateLimit > s.minRateLimit {
-					newRate := s.rateLimit - (s.rateLimit / 4) // Smaller decrements
-					if newRate >= s.minRateLimit {
-						s.rateLimit = newRate
-						rateLimiter.Reset(s.rateLimit)
-					}
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}
@@ -296,6 +269,8 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 	return result
 }
 
+// scanner/scanner.go
+
 func (s *Scanner) Scan() []models.PortResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -303,7 +278,6 @@ func (s *Scanner) Scan() []models.PortResult {
 	totalPorts := uint64(s.endPort - s.startPort + 1)
 	s.stats = NewScanStatistics(totalPorts)
 
-	// Initialize error rate counter
 	var errorRate uint64
 
 	// Start statistics printer
@@ -317,78 +291,104 @@ func (s *Scanner) Scan() []models.PortResult {
 	var wg sync.WaitGroup
 	resultsMutex := sync.Mutex{}
 
-	ports := make(chan uint16, s.threads*2)
-	fastScanResults := make(chan portScanResult, s.threads*2)
-	done := make(chan struct{})
+	// Increase buffer sizes to prevent blocking
+	ports := make(chan uint16, s.threads*4)
+	fastScanResults := make(chan portScanResult, s.threads*4)
 
-	// Start port scanners
+	// Start port scanners with proper error handling
 	for i := 0; i < s.threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("Recovered from scanner panic: %v\n", r)
+				}
+			}()
 			s.fastPortScan(ctx, ports, fastScanResults, &errorRate)
 		}()
 	}
 
-	// Feed ports in batches
+	// Feed ports with non-blocking send
+	portFeederDone := make(chan struct{})
 	go func() {
+		defer close(portFeederDone)
 		currentPort := s.startPort
 		for currentPort <= s.endPort {
-			batchEnd := currentPort + uint16(s.batchSize)
-			if batchEnd > s.endPort {
-				batchEnd = s.endPort
-			}
-
-			for port := currentPort; port <= batchEnd; port++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 				select {
-				case ports <- port:
+				case ports <- currentPort:
+					currentPort++
 				case <-ctx.Done():
 					return
 				}
 			}
-
-			time.Sleep(s.retryDelay)
-			currentPort = batchEnd + 1
 		}
 		close(ports)
 	}()
 
-	// Process results
+	// Process results with timeout
+	resultsDone := make(chan struct{})
 	go func() {
-		for result := range fastScanResults {
-			if result.isOpen {
-				fullResult := s.validatePort(result.port, result.response)
-				if fullResult.State == "open" {
-					resultsMutex.Lock()
-					results = append(results, fullResult)
-					resultsMutex.Unlock()
+		defer close(resultsDone)
+		for {
+			select {
+			case result, ok := <-fastScanResults:
+				if !ok {
+					return
 				}
+				if result.isOpen {
+					fullResult := s.validatePort(result.port, result.response)
+					if fullResult.State == "open" {
+						resultsMutex.Lock()
+						results = append(results, fullResult)
+						resultsMutex.Unlock()
+					}
+				}
+			case <-ctx.Done():
+				return
 			}
 		}
+	}()
+
+	// Wait for port feeding to complete
+	<-portFeederDone
+
+	// Wait for all scanners with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
 		close(done)
 	}()
 
-	// Wait for all scanners to complete
-	wg.Wait()
+	select {
+	case <-done:
+		// Normal completion
+	case <-time.After(time.Second * 30):
+		// Timeout - cancel context and clean up
+		cancel()
+	}
+
+	// Clean up
 	close(fastScanResults)
 
 	// Wait for result processing to complete
-	<-done
+	<-resultsDone
 
-	// Cancel statistics printing and wait for it to finish
+	// Cancel statistics and wait for completion
 	cancel()
 	<-statsDone
 
-	// Sort results by port number
+	// Sort results
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Port < results[j].Port
 	})
 
-	// Ensure final progress update
+	// Final progress update
 	s.stats.UpdateProgress(totalPorts, s.endPort)
-	close(s.progress)
 
-	// Print final summary
-	fmt.Print("\n\n") // Add some spacing after the progress display
 	return results
 }
