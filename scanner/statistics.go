@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -83,15 +84,6 @@ func (s *ScanStatistics) IncrementErrors() {
 	s.ErrorCount++
 }
 
-func (s *ScanStatistics) GetProgress() float64 {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	if s.TotalPorts == 0 {
-		return 0
-	}
-	return float64(s.PortsScanned) / float64(s.TotalPorts) * 100
-}
-
 func (s *ScanStatistics) GetAverageResponseTime() time.Duration {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -119,15 +111,20 @@ func (s *ScanStatistics) String() string {
 
 	var b strings.Builder
 
-	// Calculate progress bar
+	// Calculate progress bar with bounds checking
 	progress := s.GetProgress()
 	width := 40
+	// Ensure progress is between 0 and 100
+	progress = math.Max(0, math.Min(100, progress))
 	complete := int(progress * float64(width) / 100)
+	// Ensure complete is between 0 and width
+	complete = int(math.Max(0, math.Min(float64(width), float64(complete))))
+	remaining := width - complete
 
-	// Progress bar with percentage
+	// Progress bar with validated values
 	b.WriteString(fmt.Sprintf("\033[2K\rProgress: [%s%s] %.1f%%\n",
 		strings.Repeat("=", complete),
-		strings.Repeat(" ", width-complete),
+		strings.Repeat(" ", remaining),
 		progress))
 
 	// Scan time and current status
@@ -177,4 +174,18 @@ func (s *ScanStatistics) String() string {
 	}
 
 	return b.String()
+}
+
+// Improve progress calculation
+func (s *ScanStatistics) GetProgress() float64 {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if s.TotalPorts == 0 {
+		return 0
+	}
+
+	progress := float64(s.PortsScanned) / float64(s.TotalPorts) * 100
+	// Ensure progress is between 0 and 100
+	return math.Max(0, math.Min(100, progress))
 }
