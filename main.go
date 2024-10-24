@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,8 +14,6 @@ import (
 
 	"GoKnocker/models"
 	"GoKnocker/scanner"
-
-	"github.com/mattn/go-isatty"
 )
 
 const (
@@ -23,7 +22,7 @@ const (
 	DEFAULT_RATE    = 1000
 	MIN_RATE        = 100
 	MAX_RATE        = 2000
-	VERSION         = "2.0.0"
+	VERSION         = "1.1.0"
 )
 
 func main() {
@@ -49,57 +48,62 @@ func main() {
 
 	if results != nil {
 		printResults(results)
+		printSummary(results)
 	}
 }
 
 func printBanner() {
-	fmt.Printf(`
-╔═══════════════════════════════════════╗
-║             GoKnocker v%s           ║
-║      Port Scanner and Service Probe   ║
-╚═══════════════════════════════════════╝
-
+	fmt.Printf("\033[1;34m") // Blue text
+	fmt.Println(`
+   ______      ____                      __            
+  / ____/___  / / /_____  ____  _______/ /_____  _____
+ / / __/ __ \/ / //_/ _ \/ __ \/ ___/ //_/ _ \/ ___/
+/ /_/ / /_/ / / ,< /  __/ / / / /__/ ,< /  __/ /    
+\____/\____/_/_/|_|\___/_/ /_/\___/_/|_|\___/_/     
+                                         
 `, VERSION)
+	fmt.Printf("\033[0m") // Reset color
+	fmt.Println("\nFast and Feature-rich Port Scanner written in Go")
+	fmt.Printf("Running on %s %s (%s)\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	fmt.Println("Press Ctrl+C at any time to stop the scan")
+	fmt.Println()
 }
 
 func configureHost(s *scanner.Scanner, reader *bufio.Reader) {
 	for {
-		fmt.Print("Enter target host (e.g., localhost or example.com): ")
+		fmt.Print("\033[1m[*] Enter target host\033[0m (e.g., localhost or example.com): ")
 		host, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
+			fmt.Printf("\033[31mError reading input: %v\033[0m\n", err)
 			continue
 		}
 
 		host = strings.TrimSpace(host)
-		if host == "" {
-			continue
-		}
-
 		s.SetHost(host)
 
-		// Validate and resolve hostname
-		if ip := net.ParseIP(host); ip == nil {
-			fmt.Printf("Resolving hostname %s...\n", host)
-			addrs, err := net.LookupHost(host)
-			if err != nil {
-				fmt.Printf("Error resolving host: %v\n", err)
-				continue
+		if s.GetHost() != "" {
+			if ip := net.ParseIP(s.GetHost()); ip == nil {
+				fmt.Printf("\033[33mResolving hostname %s...\033[0m\n", s.GetHost())
+				if addrs, err := net.LookupHost(s.GetHost()); err == nil {
+					s.SetHost(addrs[0])
+					fmt.Printf("\033[32mResolved to IP: %s\033[0m\n", s.GetHost())
+				} else {
+					fmt.Printf("\033[31mError resolving host: %v\033[0m\n", err)
+					continue
+				}
 			}
-			s.SetHost(addrs[0])
-			fmt.Printf("Resolved to IP: %s\n", s.GetHost())
+			break
 		}
-		break
 	}
 }
 
 func configurePortRange(s *scanner.Scanner, reader *bufio.Reader) {
-	// Start port configuration
+	// Start port
 	for {
-		fmt.Print("Enter start port (default 1): ")
+		fmt.Print("\033[1m[*] Enter start port\033[0m (default 1): ")
 		startStr, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
+			fmt.Printf("\033[31mError reading input: %v\033[0m\n", err)
 			continue
 		}
 
@@ -110,19 +114,19 @@ func configurePortRange(s *scanner.Scanner, reader *bufio.Reader) {
 
 		start, err := strconv.Atoi(startStr)
 		if err != nil || start < 1 || start > 65535 {
-			fmt.Println("Invalid port number. Please enter a number between 1 and 65535.")
+			fmt.Println("\033[31mInvalid port number. Please enter a number between 1 and 65535.\033[0m")
 			continue
 		}
 		s.SetStartPort(uint16(start))
 		break
 	}
 
-	// End port configuration
+	// End port
 	for {
-		fmt.Print("Enter end port (default 65535): ")
+		fmt.Print("\033[1m[*] Enter end port\033[0m (default 65535): ")
 		endStr, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
+			fmt.Printf("\033[31mError reading input: %v\033[0m\n", err)
 			continue
 		}
 
@@ -133,16 +137,16 @@ func configurePortRange(s *scanner.Scanner, reader *bufio.Reader) {
 
 		end, err := strconv.Atoi(endStr)
 		if err != nil || end < 1 || end > 65535 {
-			fmt.Println("Invalid port number. Please enter a number between 1 and 65535.")
+			fmt.Println("\033[31mInvalid port number. Please enter a number between 1 and 65535.\033[0m")
 			continue
 		}
 		s.SetEndPort(uint16(end))
 		break
 	}
 
-	// Validate and swap if necessary
+	// Validate port range
 	if s.GetStartPort() > s.GetEndPort() {
-		fmt.Println("Warning: Start port is greater than end port, swapping values.")
+		fmt.Println("\033[33mWarning: Start port is greater than end port, swapping values.\033[0m")
 		start := s.GetStartPort()
 		s.SetStartPort(s.GetEndPort())
 		s.SetEndPort(start)
@@ -150,14 +154,14 @@ func configurePortRange(s *scanner.Scanner, reader *bufio.Reader) {
 }
 
 func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
-	fmt.Println("\nAdvanced Options (press Enter to use defaults):")
+	fmt.Println("\n\033[1mAdvanced Options\033[0m (press Enter to use defaults):")
 
 	// Configure threads
 	for {
-		fmt.Printf("Enter number of concurrent threads (default %d): ", DEFAULT_THREADS)
+		fmt.Printf("\033[1m[*] Enter number of concurrent threads\033[0m (default %d): ", DEFAULT_THREADS)
 		threadsStr, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
+			fmt.Printf("\033[31mError reading input: %v\033[0m\n", err)
 			continue
 		}
 
@@ -168,7 +172,7 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 
 		threads, err := strconv.Atoi(threadsStr)
 		if err != nil || threads < 1 {
-			fmt.Println("Invalid thread count. Please enter a positive number.")
+			fmt.Println("\033[31mInvalid thread count. Please enter a positive number.\033[0m")
 			continue
 		}
 		s.SetThreads(threads)
@@ -177,10 +181,10 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 
 	// Configure timeout
 	for {
-		fmt.Printf("Enter connection timeout in seconds (default %d): ", DEFAULT_TIMEOUT)
+		fmt.Printf("\033[1m[*] Enter connection timeout in seconds\033[0m (default %d): ", DEFAULT_TIMEOUT)
 		timeoutStr, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
+			fmt.Printf("\033[31mError reading input: %v\033[0m\n", err)
 			continue
 		}
 
@@ -191,7 +195,7 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 
 		timeout, err := strconv.Atoi(timeoutStr)
 		if err != nil || timeout < 1 {
-			fmt.Println("Invalid timeout. Please enter a positive number.")
+			fmt.Println("\033[31mInvalid timeout. Please enter a positive number.\033[0m")
 			continue
 		}
 		s.SetTimeout(time.Duration(timeout) * time.Second)
@@ -200,10 +204,11 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 
 	// Configure scan rate
 	for {
-		fmt.Printf("Enter scan rate (scans per second, default %d, min %d, max %d): ", DEFAULT_RATE, MIN_RATE, MAX_RATE)
+		fmt.Printf("\033[1m[*] Enter scan rate\033[0m (scans per second, default %d, min %d, max %d): ",
+			DEFAULT_RATE, MIN_RATE, MAX_RATE)
 		rateStr, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
+			fmt.Printf("\033[31mError reading input: %v\033[0m\n", err)
 			continue
 		}
 
@@ -214,30 +219,29 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 
 		rate, err := strconv.Atoi(rateStr)
 		if err != nil || rate < MIN_RATE || rate > MAX_RATE {
-			fmt.Printf("Invalid rate. Please enter a number between %d and %d.\n", MIN_RATE, MAX_RATE)
+			fmt.Printf("\033[31mInvalid rate. Please enter a number between %d and %d.\033[0m\n",
+				MIN_RATE, MAX_RATE)
 			continue
 		}
 		s.SetRateLimit(time.Second / time.Duration(rate))
 		break
 	}
-
-	// Configure detailed statistics
-	if isatty.IsTerminal(os.Stdout.Fd()) {
-		fmt.Print("Enable detailed statistics display? (y/N): ")
-		detailedStr, _ := reader.ReadString('\n')
-		if strings.ToLower(strings.TrimSpace(detailedStr)) == "y" {
-			s.EnableDetailedStats(true)
-		}
-	}
 }
 
 func startScan(s *scanner.Scanner, sigChan chan os.Signal) []models.PortResult {
-	// Print scan configuration
-	fmt.Printf("\nScan Configuration:")
-	fmt.Printf("\n• Target: %s", s.GetHost())
-	fmt.Printf("\n• Port range: %d-%d", s.GetStartPort(), s.GetEndPort())
-	fmt.Printf("\n• Scan rate: %.0f scans/second", float64(time.Second)/float64(s.GetRateLimit()))
-	fmt.Println("\n\nStarting scan...")
+	fmt.Println("\n\033[1mScan Configuration:\033[0m")
+	fmt.Printf("Target: \033[1;32m%s\033[0m\n", s.GetHost())
+	fmt.Printf("Port Range: \033[1;32m%d-%d\033[0m\n", s.GetStartPort(), s.GetEndPort())
+	fmt.Printf("Threads: \033[1;32m%d\033[0m\n", s.GetThreads())
+	fmt.Printf("Timeout: \033[1;32m%v\033[0m\n", s.GetTimeout())
+	fmt.Printf("Scan Rate: \033[1;32m%.0f\033[0m scans/second\n",
+		float64(time.Second)/float64(s.GetRateLimit()))
+
+	fmt.Println("\n\033[1mStarting scan...\033[0m")
+	// Add empty lines for statistics display
+	fmt.Println(strings.Repeat("\n", 15))
+
+	startTime := time.Now()
 
 	// Start scanning in a goroutine
 	resultsChan := make(chan []models.PortResult, 1)
@@ -248,80 +252,133 @@ func startScan(s *scanner.Scanner, sigChan chan os.Signal) []models.PortResult {
 	// Wait for either scan completion or interrupt
 	select {
 	case results := <-resultsChan:
+		duration := time.Since(startTime)
+		fmt.Printf("\n\033[1;32mScan completed in %v\033[0m\n", duration)
+		fmt.Printf("Scanned port range: %d-%d\n", s.GetStartPort(), s.GetEndPort())
 		return results
 
 	case <-sigChan:
-		fmt.Printf("\nReceived interrupt signal. Shutting down gracefully...\n")
+		fmt.Printf("\n\033[1;31mReceived interrupt signal. Shutting down...\033[0m\n")
 		return nil
 	}
 }
 
 func printResults(results []models.PortResult) {
+	fmt.Printf("\n\033[1mScan Results:\033[0m\n")
+	fmt.Printf("Found \033[1;32m%d\033[0m open ports\n\n", len(results))
+
 	if len(results) == 0 {
-		fmt.Println("\nNo open ports found")
+		fmt.Println("\033[33mNo open ports found\033[0m")
 		return
 	}
 
-	fmt.Printf("\nScan Results: %d open ports found\n", len(results))
-	fmt.Println("════════════════════════════════════════════")
+	// Print results in a table format
+	fmt.Println("\033[1mPORT      STATE    SERVICE    VERSION    RESPONSE TIME\033[0m")
+	fmt.Println(strings.Repeat("-", 70))
 
 	for _, result := range results {
-		fmt.Printf("\nPort %d/tcp\n", result.Port)
-		fmt.Printf("  State: %s\n", result.State)
+		// Basic port information
+		fmt.Printf("%-9d %-8s %-10s %-10s %v\n",
+			result.Port,
+			formatState(result.State),
+			formatService(result.Service),
+			truncateString(result.Version, 10),
+			result.ResponseTime)
 
-		if result.Service != "" {
-			fmt.Printf("  Service: %s\n", result.Service)
-			if result.Version != "" {
-				fmt.Printf("  Version: %s\n", result.Version)
-			}
-		}
-
+		// HTTP Information
 		if result.HttpInfo != nil {
-			fmt.Printf("  HTTP Information:\n")
-			fmt.Printf("    Status Code: %d\n", result.HttpInfo.StatusCode)
+			fmt.Printf("└─ HTTP Info:\n")
+			fmt.Printf("   ├─ Status: %d\n", result.HttpInfo.StatusCode)
 			if result.HttpInfo.Title != "" {
-				fmt.Printf("    Title: %s\n", result.HttpInfo.Title)
+				fmt.Printf("   ├─ Title: %s\n", result.HttpInfo.Title)
 			}
 			if result.HttpInfo.Server != "" {
-				fmt.Printf("    Server: %s\n", result.HttpInfo.Server)
+				fmt.Printf("   ├─ Server: %s\n", result.HttpInfo.Server)
 			}
 			if result.HttpInfo.PoweredBy != "" {
-				fmt.Printf("    Powered By: %s\n", result.HttpInfo.PoweredBy)
-			}
-			if result.HttpInfo.ContentType != "" {
-				fmt.Printf("    Content Type: %s\n", result.HttpInfo.ContentType)
-			}
-			if result.HttpInfo.Location != "" {
-				fmt.Printf("    Redirect: %s\n", result.HttpInfo.Location)
+				fmt.Printf("   ├─ Powered By: %s\n", result.HttpInfo.PoweredBy)
 			}
 
-			if result.Service == "HTTPS" {
-				if result.HttpInfo.TLSVersion != "" {
-					fmt.Printf("    TLS Information:\n")
-					fmt.Printf("      Version: %s\n", result.HttpInfo.TLSVersion)
-					fmt.Printf("      Cipher: %s\n", result.HttpInfo.TLSCipher)
-					if result.HttpInfo.TLSCert != "" {
-						fmt.Printf("      Certificate: %s\n", result.HttpInfo.TLSCert)
-					}
-				}
-
-				if result.EnhancedInfo != nil {
-					if secHeaders, ok := result.EnhancedInfo["security_headers"].(map[string]string); ok && len(secHeaders) > 0 {
-						fmt.Printf("    Security Headers:\n")
-						for header, value := range secHeaders {
-							fmt.Printf("      %s: %s\n", header, value)
-						}
-					}
+			// TLS Information for HTTPS
+			if result.Service == "HTTPS" && result.HttpInfo.TLSVersion != "" {
+				fmt.Printf("   └─ TLS Info:\n")
+				fmt.Printf("      ├─ Version: %s\n", result.HttpInfo.TLSVersion)
+				fmt.Printf("      ├─ Cipher: %s\n", result.HttpInfo.TLSCipher)
+				if result.HttpInfo.TLSCert != "" {
+					fmt.Printf("      └─ Certificate: %s\n", result.HttpInfo.TLSCert)
 				}
 			}
 		}
 
+		// Print banner if available
 		if len(result.Banner) > 0 {
-			fmt.Printf("  Banner: %s\n", string(result.Banner))
+			fmt.Printf("└─ Banner: %s\n", formatBanner(string(result.Banner)))
 		}
 
-		fmt.Printf("  Response Time: %v\n", result.ResponseTime)
+		fmt.Println()
+	}
+}
+
+func printSummary(results []models.PortResult) {
+	// Count services
+	services := make(map[string]int)
+	var totalResponseTime time.Duration
+
+	for _, result := range results {
+		if result.Service != "" {
+			services[result.Service]++
+		}
+		totalResponseTime += result.ResponseTime
 	}
 
-	fmt.Println("\n════════════════════════════════════════════")
+	fmt.Printf("\n\033[1mScan Summary:\033[0m\n")
+	// Calculate total ports from the results
+	fmt.Printf("Total Ports Found: \033[1;32m%d\033[0m\n", len(results))
+
+	if len(results) > 0 {
+		fmt.Printf("Average Response Time: \033[1;32m%v\033[0m\n",
+			totalResponseTime/time.Duration(len(results)))
+
+		fmt.Println("\n\033[1mService Distribution:\033[0m")
+		for service, count := range services {
+			fmt.Printf("%-15s: \033[1;32m%d\033[0m\n", service, count)
+		}
+	}
+}
+
+// Helper functions
+func formatState(state string) string {
+	switch state {
+	case "open":
+		return "\033[1;32m" + state + "\033[0m"
+	case "filtered":
+		return "\033[1;33m" + state + "\033[0m"
+	default:
+		return "\033[1;31m" + state + "\033[0m"
+	}
+}
+
+func formatService(service string) string {
+	if service == "" {
+		return "\033[1;30munknown\033[0m"
+	}
+	return service
+}
+
+func truncateString(s string, length int) string {
+	if len(s) <= length {
+		return s
+	}
+	return s[:length-3] + "..."
+}
+
+func formatBanner(banner string) string {
+	// Remove non-printable characters and trim spaces
+	banner = strings.Map(func(r rune) rune {
+		if r < 32 || r > 126 {
+			return ' '
+		}
+		return r
+	}, banner)
+	return strings.TrimSpace(banner)
 }

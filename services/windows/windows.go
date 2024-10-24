@@ -27,33 +27,51 @@ func formatAddress(host string, port uint16) string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
-// ProbeService is the main entry point for Windows service detection
+// services/windows/windows.go
+
 func ProbeService(host string, port uint16, timeout time.Duration) (string, string) {
-	switch port {
-	case 53:
-		return NewDNSService(timeout).Probe(host, port)
-
-	case 88:
-		return "Kerberos", "Microsoft Windows Kerberos"
-
-	case 135, 593:
-		return NewRPCService(timeout).Probe(host, port)
-
-	case 139, 445:
-		return NewSMBService(timeout).Probe(host, port)
-
-	case 389, 636, 3268, 3269:
-		return NewLDAPService(timeout).Probe(host, port)
-
-	case 464:
-		return "Kpasswd", "Microsoft Windows Kerberos Password Change"
-
-	case 5985:
-		if info := services.ProbeHTTP(host, port, timeout, false); info != nil {
-			return "WinRM", "Microsoft HTTPAPI httpd 2.0"
-		}
-		return "WinRM", ""
+	// Try specific service probes first
+	if service, version := trySpecificProbes(host, port, timeout); service != "" {
+		return service, version
 	}
 
+	// Fall back to generic service mapping
+	if serviceName, ok := ServicePorts[port]; ok {
+		switch port {
+		case 88:
+			return "Kerberos", "Microsoft Windows Kerberos"
+		case 464:
+			return "Kpasswd", "Microsoft Windows Kerberos Password Change"
+		case 5985:
+			if info := services.ProbeHTTP(host, port, timeout, false); info != nil {
+				return "WinRM", "Microsoft HTTPAPI httpd " + info.Server
+			}
+		}
+		return serviceName, fmt.Sprintf("Microsoft Windows %s", serviceName)
+	}
+
+	return "", ""
+}
+
+func trySpecificProbes(host string, port uint16, timeout time.Duration) (string, string) {
+	// Map of port numbers to their specific probe services
+	probes := map[uint16]struct {
+		service interface {
+			Probe(string, uint16) (string, string)
+		}
+	}{
+		53:   {NewDNSService(timeout)},
+		135:  {NewRPCService(timeout)},
+		139:  {NewSMBService(timeout)},
+		389:  {NewLDAPService(timeout)},
+		445:  {NewSMBService(timeout)},
+		636:  {NewLDAPService(timeout)},
+		3268: {NewLDAPService(timeout)},
+		3269: {NewLDAPService(timeout)},
+	}
+
+	if probeInfo, ok := probes[port]; ok {
+		return probeInfo.service.Probe(host, port)
+	}
 	return "", ""
 }

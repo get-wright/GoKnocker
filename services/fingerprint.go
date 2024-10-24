@@ -3,6 +3,8 @@ package services
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"regexp"
 	"strings"
 )
 
@@ -10,6 +12,18 @@ import (
 type ProtocolFingerprint struct {
 	Response []byte
 }
+
+// Common protocol patterns
+var (
+	kerberosPattern = []byte{0x6a, 0x82} // ASN.1 Kerberos tag
+	vmrdpPattern    = []byte{0x03, 0x00} // RDP protocol identifier
+	dotnetPattern   = []byte{0x0e, 0x00} // .NET Binary Format
+
+	// Version extraction patterns
+	versionRegex  = regexp.MustCompile(`(?i)(?:version|ver)[:\s]+([0-9][0-9a-zA-Z._\-]+)`)
+	mssqlRegex    = regexp.MustCompile(`(?i)Microsoft SQL Server\s+([0-9][0-9a-zA-Z._\-]+)`)
+	kerberosRegex = regexp.MustCompile(`(?i)kerberos\s+([0-9][0-9a-zA-Z._\-]+)`)
+)
 
 // NewFingerprint creates a new protocol fingerprint from response
 func NewFingerprint(response []byte) *ProtocolFingerprint {
@@ -22,38 +36,42 @@ func (p *ProtocolFingerprint) IdentifyProtocol() string {
 		return ""
 	}
 
-	if p.IsHTTP() {
+	// Try to identify protocols in order of complexity and uniqueness
+	switch {
+	case p.IsHTTP():
 		return "HTTP"
-	}
-	if p.IsSSH() {
+	case p.IsSSH():
 		return "SSH"
-	}
-	if p.IsSMB() {
+	case p.IsSMB():
 		return "SMB"
-	}
-	if p.IsLDAP() {
+	case p.IsLDAP():
 		return "LDAP"
-	}
-	if p.IsDNS() {
+	case p.IsDNS():
 		return "DNS"
-	}
-	if p.IsRPC() {
+	case p.IsRPC():
 		return "RPC"
-	}
-	if p.IsKerberos() {
-		return "Kerberos"
-	}
-	if p.IsFTP() {
+	case p.IsKerberos():
+		return "KERBEROS"
+	case p.IsFTP():
 		return "FTP"
-	}
-	if p.IsMSSQL() {
+	case p.IsMSSQL():
 		return "MSSQL"
-	}
-	if p.IsMySQL() {
+	case p.IsMySQL():
 		return "MySQL"
-	}
-	if p.IsRDP() {
+	case p.IsRDP():
 		return "RDP"
+	case p.IsVMRDP():
+		return "VMRDP"
+	case p.IsDotNet():
+		return "DOTNET"
+	case p.IsPOP3():
+		return "POP3"
+	case p.IsIMAP():
+		return "IMAP"
+	case p.IsSMTP():
+		return "SMTP"
+	case p.IsNTLM():
+		return "NTLM"
 	}
 
 	return ""
@@ -97,7 +115,6 @@ func (p *ProtocolFingerprint) IsLDAP() bool {
 	if len(p.Response) < 2 {
 		return false
 	}
-	// Check for LDAP message header
 	return p.Response[0] == 0x30 && // Sequence
 		len(p.Response) > int(p.Response[1])+2
 }
@@ -106,7 +123,6 @@ func (p *ProtocolFingerprint) IsDNS() bool {
 	if len(p.Response) < 12 {
 		return false
 	}
-	// Check DNS header format
 	flags := binary.BigEndian.Uint16(p.Response[2:4])
 	return (flags & 0x8000) != 0 // Check QR bit
 }
@@ -115,7 +131,6 @@ func (p *ProtocolFingerprint) IsRPC() bool {
 	if len(p.Response) < 10 {
 		return false
 	}
-	// Check RPC header
 	return p.Response[0] == 0x05 && // Version 5
 		p.Response[2] == 0x0b // Bind packet type
 }
@@ -124,64 +139,104 @@ func (p *ProtocolFingerprint) IsKerberos() bool {
 	if len(p.Response) < 4 {
 		return false
 	}
-	// Check Kerberos message header
-	return p.Response[0] == 0x6a && // Application 10
-		p.Response[1] == 0x82 // Length field
+	return bytes.HasPrefix(p.Response, kerberosPattern)
 }
 
 func (p *ProtocolFingerprint) IsFTP() bool {
 	response := string(p.Response)
 	return strings.HasPrefix(response, "220 ") &&
-		(strings.Contains(response, "FTP") ||
-			strings.Contains(response, "ftp"))
+		(strings.Contains(strings.ToLower(response), "ftp") ||
+			strings.Contains(response, "FileZilla"))
 }
 
 func (p *ProtocolFingerprint) IsMSSQL() bool {
 	if len(p.Response) < 8 {
 		return false
 	}
-	// Check for MS-TDS header
 	return p.Response[0] == 0x04 && // Type 4 (SQL Server)
 		p.Response[1] == 0x01 // Status
 }
 
 func (p *ProtocolFingerprint) IsMySQL() bool {
 	return len(p.Response) > 4 &&
-		bytes.Contains(p.Response, []byte("mysql"))
+		bytes.Contains(bytes.ToLower(p.Response), []byte("mysql"))
 }
 
 func (p *ProtocolFingerprint) IsRDP() bool {
-	return len(p.Response) > 5 &&
-		p.Response[0] == 0x03 && // TPKT version 3
+	if len(p.Response) < 5 {
+		return false
+	}
+	return p.Response[0] == 0x03 && // TPKT version 3
 		p.Response[1] == 0x00 && // Reserved
 		p.Response[4] == 0x02 // X.224 connection confirm
+}
+
+func (p *ProtocolFingerprint) IsVMRDP() bool {
+	if len(p.Response) < 4 {
+		return false
+	}
+	return bytes.HasPrefix(p.Response, vmrdpPattern)
+}
+
+func (p *ProtocolFingerprint) IsDotNet() bool {
+	if len(p.Response) < 4 {
+		return false
+	}
+	return bytes.HasPrefix(p.Response, dotnetPattern)
+}
+
+func (p *ProtocolFingerprint) IsPOP3() bool {
+	response := string(p.Response)
+	return strings.HasPrefix(response, "+OK") &&
+		strings.Contains(strings.ToLower(response), "pop3")
+}
+
+func (p *ProtocolFingerprint) IsIMAP() bool {
+	response := string(p.Response)
+	return strings.HasPrefix(response, "* OK") &&
+		strings.Contains(strings.ToLower(response), "imap")
+}
+
+func (p *ProtocolFingerprint) IsSMTP() bool {
+	response := string(p.Response)
+	return strings.HasPrefix(response, "220") &&
+		strings.Contains(strings.ToLower(response), "smtp")
+}
+
+func (p *ProtocolFingerprint) IsNTLM() bool {
+	return bytes.Contains(p.Response, []byte("NTLMSSP"))
 }
 
 // ExtractVersion attempts to extract version information from the response
 func (p *ProtocolFingerprint) ExtractVersion() string {
 	response := string(p.Response)
 
-	// SSH Version
-	if strings.HasPrefix(response, "SSH-") {
+	// Try protocol-specific version extraction first
+	switch {
+	case p.IsMSSQL():
+		if matches := mssqlRegex.FindStringSubmatch(response); len(matches) > 1 {
+			return "Microsoft SQL Server " + matches[1]
+		}
+	case p.IsKerberos():
+		if matches := kerberosRegex.FindStringSubmatch(response); len(matches) > 1 {
+			return "Microsoft Windows Kerberos " + matches[1]
+		}
+	case p.IsSSH():
 		parts := strings.SplitN(response, " ", 2)
 		if len(parts) > 1 {
 			return strings.TrimSpace(parts[1])
 		}
 	}
 
-	// HTTP Server Version
-	if strings.Contains(response, "Server: ") {
-		lines := strings.Split(response, "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "Server: ") {
-				return strings.TrimSpace(strings.TrimPrefix(line, "Server: "))
-			}
-		}
+	// Try general version extraction
+	if matches := versionRegex.FindStringSubmatch(response); len(matches) > 1 {
+		return matches[1]
 	}
 
-	// FTP Version
-	if strings.HasPrefix(response, "220 ") {
-		return strings.TrimSpace(strings.TrimPrefix(response, "220 "))
+	// Look for version-like patterns in hex
+	hexStr := hex.EncodeToString(p.Response)
+	if matches := regexp.MustCompile(`(?i)([0-9]+\.[0-9]+\.[0-9]+)`).FindString(hexStr); matches != "" {
+		return matches
 	}
 
 	return ""
