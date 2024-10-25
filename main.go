@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"GoKnocker/banner"
 	"GoKnocker/models"
 	"GoKnocker/scanner"
 )
@@ -24,10 +25,13 @@ const (
 // main.go
 
 func main() {
-	printBanner()
+	banner.PrintBanner()
 
 	scanner := scanner.NewScanner()
 	reader := bufio.NewReader(os.Stdin)
+
+	// Wait for user input before continuing
+	reader.ReadString('\n')
 
 	// Configure scanner...
 	configureHost(scanner, reader)
@@ -68,7 +72,12 @@ func main() {
 				done = true
 				break
 			}
+			// Only update if significant change or completion
 			if progress-lastProgress >= 0.1 || progress >= 100 {
+				// Ensure progress doesn't exceed 100%
+				if progress > 100 {
+					progress = 100
+				}
 				fmt.Printf("\r%s %.1f%% %s",
 					renderProgressBar(progress, progressWidth),
 					progress,
@@ -79,6 +88,10 @@ func main() {
 			// Update spinner even without progress change
 			spinIndex = (spinIndex + 1) % len(spinChars)
 			if lastProgress >= 0 {
+				// Ensure lastProgress doesn't exceed 100%
+				if lastProgress > 100 {
+					lastProgress = 100
+				}
 				fmt.Printf("\r%s %.1f%% %s",
 					renderProgressBar(lastProgress, progressWidth),
 					lastProgress,
@@ -86,8 +99,6 @@ func main() {
 			}
 		}
 	}
-
-	// Ensure 100% is shown
 	fmt.Printf("\r%s 100.0%%\n\n", renderProgressBar(100.0, progressWidth))
 
 	results := <-resultsChan
@@ -98,8 +109,27 @@ func main() {
 }
 
 func renderProgressBar(progress float64, width int) string {
-	fill := int(progress / 100 * float64(width))
+	// Ensure progress is between 0 and 100
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 100 {
+		progress = 100
+	}
+
+	// Calculate fill based on clamped progress
+	fill := int((progress / 100) * float64(width))
+	if fill < 0 {
+		fill = 0
+	}
+	if fill > width {
+		fill = width
+	}
+
 	empty := width - fill
+	if empty < 0 {
+		empty = 0
+	}
 
 	bar := "["
 	bar += strings.Repeat("=", fill)
@@ -111,12 +141,6 @@ func renderProgressBar(progress float64, width int) string {
 	bar += "]"
 
 	return bar
-}
-
-func printBanner() {
-	fmt.Println("=== GoKnocker ===")
-	fmt.Println("Knock Knock! Any ports open?")
-	fmt.Println()
 }
 
 func configureHost(s *scanner.Scanner, reader *bufio.Reader) {
@@ -227,7 +251,7 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 }
 
 func printResults(results []models.PortResult, duration time.Duration) {
-	fmt.Printf("Scan completed in %v\n", duration)
+	fmt.Printf("\nScan completed in %v\n", duration)
 	fmt.Printf("Found %d open ports:\n\n", len(results))
 
 	if len(results) == 0 {

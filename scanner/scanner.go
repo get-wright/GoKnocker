@@ -34,6 +34,9 @@ type Scanner struct {
 	serviceIdentifier *fingerprint.ServiceIdentifier
 	customPorts       map[uint16]string
 	debugLogger       *DebugLogger
+	portsScanned      int64 // Add this field to track scanned ports
+	totalPorts        int64 // Add this field to track total ports
+	progressMutex     sync.Mutex
 }
 
 func NewScanner() *Scanner {
@@ -48,7 +51,7 @@ func NewScanner() *Scanner {
 		minRateLimit: time.Microsecond * 500, // Max 2000 scans per second
 		maxRateLimit: time.Millisecond * 5,   // Min 200 scans per second
 		results:      make(chan models.PortResult),
-		progress:     make(chan float64),
+		progress:     make(chan float64, 100),
 		customPorts:  make(map[uint16]string),
 		debugLogger:  NewDebugLogger(false),
 	}
@@ -110,6 +113,29 @@ func (s *Scanner) SetDebug(enabled bool) {
 	s.debugLogger = NewDebugLogger(enabled)
 }
 
+func (s *Scanner) updateProgress() {
+	scanned := atomic.LoadInt64(&s.portsScanned)
+	progress := (float64(scanned) / float64(s.totalPorts)) * 100
+
+	// Clamp progress to valid range
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 100 {
+		progress = 100
+	}
+
+	s.progressMutex.Lock()
+	defer s.progressMutex.Unlock()
+
+	select {
+	case s.progress <- progress:
+		s.debugLogger.Log("Progress updated: %.2f%% (%d/%d ports)", progress, scanned, s.totalPorts)
+	default:
+		// Skip if channel is full
+	}
+}
+
 type portScanResult struct {
 	port     uint16
 	isOpen   bool
@@ -134,6 +160,10 @@ func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results c
 			conn, err := dialer.DialContext(ctx, "tcp", address)
 			duration := time.Since(start)
 
+			// Update progress after each port scan
+			atomic.AddInt64(&s.portsScanned, 1)
+			s.updateProgress()
+
 			if err == nil {
 				conn.Close()
 				s.debugLogger.Log("Port %d is open (took %v)", port, duration)
@@ -147,12 +177,6 @@ func (s *Scanner) fastPortScan(ctx context.Context, ports chan uint16, results c
 				if !strings.Contains(err.Error(), "refused") {
 					atomic.AddUint64(errorRate, 1)
 				}
-			}
-
-			// Rate limiting debug
-			if s.adjustRate {
-				errorRateValue := atomic.LoadUint64(errorRate)
-				s.debugLogger.Log("Current error rate: %d, rate limit: %v", errorRateValue, s.rateLimit)
 			}
 
 			select {
@@ -279,7 +303,6 @@ func (s *Scanner) validatePort(port uint16, initialResponse time.Duration) model
 }
 
 // scanner/scanner.go
-
 func (s *Scanner) Scan() []models.PortResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -288,23 +311,21 @@ func (s *Scanner) Scan() []models.PortResult {
 	var wg sync.WaitGroup
 	resultsMutex := sync.Mutex{}
 
+	// Initialize progress tracking
+	s.portsScanned = 0
+	s.totalPorts = int64(s.endPort - s.startPort + 1)
+
+	// Ensure valid port range
+	if s.totalPorts <= 0 {
+		s.totalPorts = 1 // Prevent division by zero
+	}
+
 	// Channels for the scan pipeline
 	ports := make(chan uint16, s.threads*2)
 	fastScanResults := make(chan portScanResult, s.threads*2)
 
 	// Error rate tracking
 	var errorRate uint64
-
-	// Progress tracking with smaller buffer
-	totalPorts := int64(s.endPort - s.startPort + 1)
-	scanned := int64(0)
-
-	// Make progress channel buffered
-	s.progress = make(chan float64, totalPorts)
-
-	// More frequent progress updates
-	progressTicker := time.NewTicker(50 * time.Millisecond)
-	defer progressTicker.Stop()
 
 	// Start fast port scanners
 	for i := 0; i < s.threads; i++ {
@@ -315,7 +336,7 @@ func (s *Scanner) Scan() []models.PortResult {
 		}()
 	}
 
-	// Feed ports to scan with progress tracking
+	// Feed ports to scan
 	go func() {
 		defer close(ports)
 		for port := s.startPort; port <= s.endPort; port++ {
@@ -327,19 +348,9 @@ func (s *Scanner) Scan() []models.PortResult {
 		}
 	}()
 
-	// Process results with progress updates
+	// Process results
 	go func() {
 		for result := range fastScanResults {
-			newCount := atomic.AddInt64(&scanned, 1)
-			progress := float64(newCount) / float64(totalPorts) * 100
-
-			// Try to send progress update
-			select {
-			case s.progress <- progress:
-			default:
-				// Skip if channel is full
-			}
-
 			if result.isOpen {
 				fullResult := s.validatePort(result.port, result.response)
 				if fullResult.State == "open" {
@@ -351,36 +362,15 @@ func (s *Scanner) Scan() []models.PortResult {
 		}
 	}()
 
-	// Additional progress monitoring goroutine
-	go func() {
-		lastProgress := float64(0)
-		for {
-			select {
-			case <-progressTicker.C:
-				currentCount := atomic.LoadInt64(&scanned)
-				progress := float64(currentCount) / float64(totalPorts) * 100
-
-				// Only send if progress has changed
-				if progress > lastProgress {
-					select {
-					case s.progress <- progress:
-						lastProgress = progress
-					default:
-						// Skip if channel is full
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
 	// Wait for completion
 	wg.Wait()
 	close(fastScanResults)
 
 	// Ensure 100% progress is sent
-	s.progress <- 100.0
+	select {
+	case s.progress <- 100.0:
+	default:
+	}
 	close(s.progress)
 
 	// Sort results
