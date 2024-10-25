@@ -21,19 +21,17 @@ const (
 	MAX_RATE        = 2000
 )
 
+// main.go
+
 func main() {
 	printBanner()
 
 	scanner := scanner.NewScanner()
 	reader := bufio.NewReader(os.Stdin)
 
-	// Get and validate host
+	// Configure scanner...
 	configureHost(scanner, reader)
-
-	// Configure port range
 	configurePortRange(scanner, reader)
-
-	// Configure advanced options
 	configureAdvancedOptions(scanner, reader)
 
 	// Start the scan
@@ -50,19 +48,69 @@ func main() {
 		resultsChan <- scanner.Scan()
 	}()
 
-	// Show progress bar
-	for progress := range scanner.GetProgressChan() {
-		fmt.Printf("\r[%s%s] %.1f%% ",
-			strings.Repeat("=", int(progress/2.5)),
-			strings.Repeat(" ", 40-int(progress/2.5)),
-			progress)
+	// Initialize progress display
+	fmt.Print("\033[2K\r") // Clear line
+	lastProgress := -1.0
+	progressWidth := 40
+	spinChars := []string{"|", "/", "-", "\\"}
+	spinIndex := 0
+
+	// Create a ticker for smooth animation
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Progress display loop
+	done := false
+	for !done {
+		select {
+		case progress, ok := <-scanner.GetProgressChan():
+			if !ok {
+				done = true
+				break
+			}
+			if progress-lastProgress >= 0.1 || progress >= 100 {
+				fmt.Printf("\r%s %.1f%% %s",
+					renderProgressBar(progress, progressWidth),
+					progress,
+					spinChars[spinIndex])
+				lastProgress = progress
+			}
+		case <-ticker.C:
+			// Update spinner even without progress change
+			spinIndex = (spinIndex + 1) % len(spinChars)
+			if lastProgress >= 0 {
+				fmt.Printf("\r%s %.1f%% %s",
+					renderProgressBar(lastProgress, progressWidth),
+					lastProgress,
+					spinChars[spinIndex])
+			}
+		}
 	}
+
+	// Ensure 100% is shown
+	fmt.Printf("\r%s 100.0%%\n\n", renderProgressBar(100.0, progressWidth))
 
 	results := <-resultsChan
 	duration := time.Since(startTime)
 
-	// Print results
+	// Print results...
 	printResults(results, duration)
+}
+
+func renderProgressBar(progress float64, width int) string {
+	fill := int(progress / 100 * float64(width))
+	empty := width - fill
+
+	bar := "["
+	bar += strings.Repeat("=", fill)
+	if empty > 0 && fill < width {
+		bar += ">"
+		empty--
+	}
+	bar += strings.Repeat(" ", empty)
+	bar += "]"
+
+	return bar
 }
 
 func printBanner() {
@@ -143,6 +191,38 @@ func configureAdvancedOptions(s *scanner.Scanner, reader *bufio.Reader) {
 	rateStr = strings.TrimSpace(rateStr)
 	if rate, err := strconv.Atoi(rateStr); err == nil && rate >= MIN_RATE && rate <= MAX_RATE {
 		s.SetRateLimit(time.Second / time.Duration(rate))
+	}
+	fmt.Println("\nCustom Port Mapping (press Enter to skip):")
+	for {
+		fmt.Print("Enter custom port mapping (format: port:service, e.g. 8022:SSH): ")
+		mapping, _ := reader.ReadString('\n')
+		mapping = strings.TrimSpace(mapping)
+
+		if mapping == "" {
+			break
+		}
+
+		parts := strings.Split(mapping, ":")
+		if len(parts) != 2 {
+			fmt.Println("Invalid format. Use port:service (e.g. 8022:SSH)")
+			continue
+		}
+
+		port, err := strconv.ParseUint(parts[0], 10, 16)
+		if err != nil || port == 0 || port > 65535 {
+			fmt.Println("Invalid port number")
+			continue
+		}
+
+		s.AddCustomPort(uint16(port), strings.TrimSpace(parts[1]))
+		fmt.Printf("Added custom mapping: Port %d -> %s\n", port, parts[1])
+	}
+	fmt.Print("Enable debug output? (y/N): ")
+	debugStr, _ := reader.ReadString('\n')
+	debugStr = strings.TrimSpace(strings.ToLower(debugStr))
+	if debugStr == "y" || debugStr == "yes" {
+		s.SetDebug(true)
+		fmt.Println("Debug output enabled")
 	}
 }
 
