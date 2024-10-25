@@ -45,8 +45,6 @@ func main() {
 	fmt.Println("\nProgress:")
 
 	startTime := time.Now()
-
-	// Start scanning in a goroutine
 	resultsChan := make(chan []models.PortResult)
 	go func() {
 		resultsChan <- scanner.Scan()
@@ -59,17 +57,18 @@ func main() {
 	spinChars := []string{"|", "/", "-", "\\"}
 	spinIndex := 0
 
-	// Create a ticker for smooth animation
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Progress display loop
 	done := false
 	for !done {
 		select {
 		case progress, ok := <-scanner.GetProgressChan():
 			if !ok {
 				done = true
+				if scanner.GetStartPort() == 1 && scanner.GetEndPort() == 65535 {
+					fmt.Printf("\nDefault scan completed (port range 1-65535).\n")
+				}
 				break
 			}
 			// Only update if significant change or completion
@@ -88,7 +87,6 @@ func main() {
 			// Update spinner even without progress change
 			spinIndex = (spinIndex + 1) % len(spinChars)
 			if lastProgress >= 0 {
-				// Ensure lastProgress doesn't exceed 100%
 				if lastProgress > 100 {
 					lastProgress = 100
 				}
